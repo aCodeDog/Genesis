@@ -1,6 +1,7 @@
 from .base_sensor import Sensor
 from .imu import IMU
 from .tactile import RigidContactSensor, RigidContactForceSensor, RigidContactForceGridSensor
+from .lidar import LidarSensor
 from .data_recorder import SensorDataRecorder, RecordingOptions
 from .data_handlers import (
     DataHandler,
