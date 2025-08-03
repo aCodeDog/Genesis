@@ -86,7 +86,9 @@ class RigidEntity(Entity):
 
         self._visualize_contact: bool = visualize_contact
 
-        self._is_free: bool = morph.is_free
+        if hasattr(morph, "fixed"):
+            morph.is_free = not morph.fixed
+        self._is_free = morph.is_free
 
         self._is_built: bool = False
 
