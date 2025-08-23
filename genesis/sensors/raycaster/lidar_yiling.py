@@ -2,27 +2,24 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 import taichi as ti
 import torch
-import trimesh
 
 import genesis as gs
 import genesis.utils.array_class as array_class
 from genesis.engine.entities import RigidEntity
 from genesis.engine.bvh import AABB, LBVH
 from genesis.utils.geom import (
-    transform_by_trans_quat,
-    ti_transform_by_quat,
-    ti_quat_mul,
     ti_normalize,
-    ti_identity_quat,
-    trans_quat_to_T,
     quat_to_R,
-    R_to_quat,
 )
 from genesis.utils.misc import tensor_to_array
 import genesis.engine.solvers.rigid.rigid_solver_decomp as rigid_solver_decomp
 
 
 from ..base_sensor import Sensor
+from .lidar_pattern import (
+    PatternBaseCfg, SphericalPatternCfg, LidarPatternCfg, BpearlPatternCfg, GridPatternCfg, LivoxPatternCfg,
+    generate_ray_pattern, create_spherical_pattern, create_pattern_generator, generate_ray_pattern_with_starts
+)
 
 MapLidarFaces = ti.template()
 
@@ -170,10 +167,11 @@ def kernel_cast_rays_bvh(
     # BVH data structures
     bvh_nodes: ti.template(),  # The BVH node tree
     bvh_morton_codes: ti.template(),  # Maps sorted leaves to original triangle indices
-    # Per-ray data
-    lidar_positions: ti.types.ndarray(ndim=3),  # [n_env, n_cam, 3]
-    lidar_quaternions: ti.types.ndarray(ndim=3),  # [n_env, n_cam, 4] (wxyz format)
-    ray_vectors: ti.types.ndarray(ndim=3),  # [n_scan_lines, n_points, 3]
+    # Per-ray data (precomputed, world frame)
+    ray_starts_world: ti.types.ndarray(ndim=5),  # [n_env, n_cam, n_scan_lines, n_points, 3]
+    ray_directions_world: ti.types.ndarray(ndim=5),  # [n_env, n_cam, n_scan_lines, n_points, 3]
+    # Optional local directions for local-frame output
+    ray_directions_local: ti.types.ndarray(ndim=3),  # [n_scan_lines, n_points, 3]
     far_plane: ti.f32,
     # Output arrays
     hit_points: ti.types.ndarray(ndim=5),  # [n_env, n_cam, n_scan_lines, n_points, 3]
@@ -188,27 +186,19 @@ def kernel_cast_rays_bvh(
     for env_id, cam_id, scan_line, point_index in ti.ndrange(
         hit_points.shape[0], hit_points.shape[1], hit_points.shape[2], hit_points.shape[3]
     ):
-        # --- 1. Setup Ray ---
-        lidar_position = ti.math.vec3(
-            lidar_positions[env_id, cam_id, 0], lidar_positions[env_id, cam_id, 1], lidar_positions[env_id, cam_id, 2]
+        # --- 1. Setup Ray (already in world frame) ---
+        ray_start_world = ti.math.vec3(
+            ray_starts_world[env_id, cam_id, scan_line, point_index, 0],
+            ray_starts_world[env_id, cam_id, scan_line, point_index, 1],
+            ray_starts_world[env_id, cam_id, scan_line, point_index, 2],
         )
-
-        lidar_quat = ti.math.vec4(
-            lidar_quaternions[env_id, cam_id, 1],  # x
-            lidar_quaternions[env_id, cam_id, 2],  # y
-            lidar_quaternions[env_id, cam_id, 3],  # z
-            lidar_quaternions[env_id, cam_id, 0],  # w
+        ray_direction_world = ti_normalize(
+            ti.math.vec3(
+                ray_directions_world[env_id, cam_id, scan_line, point_index, 0],
+                ray_directions_world[env_id, cam_id, scan_line, point_index, 1],
+                ray_directions_world[env_id, cam_id, scan_line, point_index, 2],
+            )
         )
-
-        ray_dir_local = ti.math.vec3(
-            ray_vectors[scan_line, point_index, 0],
-            ray_vectors[scan_line, point_index, 1],
-            ray_vectors[scan_line, point_index, 2],
-        )
-        ray_dir_local = ti_normalize(ray_dir_local)
-
-        # Transform ray direction to world coordinates.
-        ray_direction_world = ti_transform_by_quat(ray_dir_local, lidar_quat)
 
         # --- 2. BVH Traversal ---
         min_t = far_plane
@@ -227,7 +217,7 @@ def kernel_cast_rays_bvh(
             node = bvh_nodes[0, node_idx]
 
             # Check if ray hits the node's bounding box
-            aabb_t = ray_aabb_intersection(lidar_position, ray_direction_world, node.bound.min, node.bound.max)
+            aabb_t = ray_aabb_intersection(ray_start_world, ray_direction_world, node.bound.min, node.bound.max)
 
             if aabb_t >= 0.0 and aabb_t < min_t:
                 if node.left == -1:  # It's a LEAF node
@@ -254,7 +244,7 @@ def kernel_cast_rays_bvh(
                         v2 = fixed_verts_state.pos[verts_info.verts_state_idx[faces_info.verts_idx[i_f][2]]]
 
                     # Perform the expensive ray-triangle intersection test
-                    hit_result = ray_triangle_intersection(lidar_position, ray_direction_world, v0, v1, v2)
+                    hit_result = ray_triangle_intersection(ray_start_world, ray_direction_world, v0, v1, v2)
 
                     if hit_result.w > 0.0 and hit_result.x < min_t and hit_result.x >= 0.0:
                         min_t = hit_result.x
@@ -275,12 +265,19 @@ def kernel_cast_rays_bvh(
             hit_distances[env_id, cam_id, scan_line, point_index] = dist
 
             if world_frame:
-                hit_point = lidar_position + dist * ray_direction_world
+                hit_point = ray_start_world + dist * ray_direction_world
                 hit_points[env_id, cam_id, scan_line, point_index, 0] = hit_point.x
                 hit_points[env_id, cam_id, scan_line, point_index, 1] = hit_point.y
                 hit_points[env_id, cam_id, scan_line, point_index, 2] = hit_point.z
             else:
-                hit_point = dist * ray_dir_local
+                # Local frame output along provided local ray direction
+                hit_point = dist * ti_normalize(
+                    ti.math.vec3(
+                        ray_directions_local[scan_line, point_index, 0],
+                        ray_directions_local[scan_line, point_index, 1],
+                        ray_directions_local[scan_line, point_index, 2],
+                    )
+                )
                 hit_points[env_id, cam_id, scan_line, point_index, 0] = hit_point.x
                 hit_points[env_id, cam_id, scan_line, point_index, 1] = hit_point.y
                 hit_points[env_id, cam_id, scan_line, point_index, 2] = hit_point.z
@@ -295,24 +292,10 @@ def kernel_cast_rays_bvh(
 @ti.data_oriented
 class LidarSensor(Sensor):
     """
-    LiDAR sensor that performs ray casting to get distance measurements and point clouds.
-
-    Parameters
-    ----------
-    entity : RigidEntity
-        The entity to which this sensor is attached.
-    link_idx : int, optional
-        The index of the link to which this sensor is attached. If None, defaults to the base link.
-    use_local_frame : bool
-        Whether to return points in the local frame of the sensor. Defaults to False (world frame).
-    config : dict, optional
-        LiDAR configuration with parameters like:
-        - n_scan_lines: Number of vertical scan lines
-        - n_points_per_line: Number of horizontal points per scan line
-        - fov_vertical: Vertical field of view in degrees
-        - fov_horizontal: Horizontal field of view in degrees
-        - max_range: Maximum sensing range
-        - min_range: Minimum sensing range
+    Taichi-accelerated LiDAR sensor using BVH traversal.
+    - Supports multiple ray patterns with pattern_cfg.
+    - Mounting offset and alignment modes: world, yaw, base.
+    - Optional dynamic Livox updates.
     """
 
     _mesh_registered = False
@@ -336,7 +319,12 @@ class LidarSensor(Sensor):
         fov_horizontal: float = 360.0,
         max_range: float = 20.0,
         min_range: float = 0.1,
-        only_cast_fixed: bool = True,
+        only_cast_fixed: bool = False,
+        pattern_cfg: Optional[PatternBaseCfg] = None,
+        # New: mounting offset and alignment + drift like Warp
+        offset_pos: Tuple[float, float, float] = (0.0, 0.0, 0.0),
+        offset_quat_wxyz: Tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0),
+        ray_alignment: str = "base",  # one of {"world","yaw","base"}
     ):
 
         self._entity = entity
@@ -355,12 +343,58 @@ class LidarSensor(Sensor):
 
         self.only_cast_fixed = only_cast_fixed
 
-        # Generate ray pattern
-        self.ray_vectors = self._create_ray_pattern()
+        # Store pattern configuration
+        self.pattern_cfg = pattern_cfg
+
+        # Initialize pattern generator for dynamic patterns
+        self.pattern_generator = None
+        if self.pattern_cfg and isinstance(self.pattern_cfg, LivoxPatternCfg):
+            self.pattern_generator = create_pattern_generator(self.pattern_cfg)
+
+        # Mounting offset and alignment
+        self.offset_pos = torch.tensor(offset_pos, dtype=gs.tc_float, device=gs.device)
+        self.offset_quat_wxyz = torch.tensor(offset_quat_wxyz, dtype=gs.tc_float, device=gs.device)
+        self.ray_alignment = ray_alignment
+
+        # Generate ray pattern (local starts + dirs), then apply offset
+        self._init_local_rays_with_offset()
+
+        # Drift buffers (world drift on origin; per-ray-cast drift in sensor frame)
+        # Defer allocation until solver is built
+        self.drift = None
+        self.ray_cast_drift = None
+
+        # Dynamic pattern tracking
+        self.simulation_time = 0.0
+        self.last_pattern_update_time = 0.0
 
         # build bvh
         self.solver = self._sim.rigid_solver
         self.is_built = False
+
+    def _init_local_rays_with_offset(self):
+        # Get local starts and directions in sensor frame
+        if self.pattern_cfg is not None:
+            starts_np, dirs_np = generate_ray_pattern_with_starts(self.pattern_cfg)
+        else:
+            # default spherical
+            dirs_np = create_spherical_pattern(
+                n_scan_lines=self.config["n_scan_lines"],
+                n_points_per_line=self.config["n_points_per_line"],
+                fov_vertical=self.config["fov_vertical"],
+                fov_horizontal=self.config["fov_horizontal"],
+            )
+            starts_np = np.zeros_like(dirs_np, dtype=np.float32)
+
+        # Convert to torch
+        self.ray_starts_local = torch.tensor(starts_np, dtype=gs.tc_float, device=gs.device)  # [S,P,3]
+        self.ray_dirs_local = torch.tensor(dirs_np, dtype=gs.tc_float, device=gs.device)      # [S,P,3]
+
+        # Apply mounting offset: rotate directions, translate starts
+        # Build rotation matrix from offset quaternion (wxyz)
+        R_off = quat_to_R(self.offset_quat_wxyz.view(1, 4))[0]  # [3,3]
+        self.ray_dirs_local = torch.einsum('ij,spj->spi', R_off, self.ray_dirs_local)
+        self.ray_starts_local = self.ray_starts_local + self.offset_pos.view(1, 1, 3)
 
     def filter_lidar_faces(self):
         n_lidar_faces = self.solver.faces_info.geom_idx.shape[0]
@@ -402,28 +436,54 @@ class LidarSensor(Sensor):
         self.bvh = LBVH(self.aabbs)
         self.bvh.build()
 
+        # Allocate drift buffers now that we know n_envs
+        n_envs = self.solver.free_verts_state.pos.shape[1]
+        if self.drift is None or self.drift.shape[0] != n_envs:
+            self.drift = torch.zeros((n_envs, 3), dtype=gs.tc_float, device=gs.device)
+            self.ray_cast_drift = torch.zeros((n_envs, 3), dtype=gs.tc_float, device=gs.device)
+
     def _create_ray_pattern(self) -> np.ndarray:
-        """Create LiDAR ray pattern based on configuration."""
-        n_scan_lines = self.config["n_scan_lines"]
-        n_points_per_line = self.config["n_points_per_line"]
-        fov_v = np.radians(self.config["fov_vertical"])
-        fov_h = np.radians(self.config["fov_horizontal"])
+        """Create LiDAR ray pattern based on configuration.
+        Deprecated by _init_local_rays_with_offset for new flow; kept for compatibility."""
+        if self.pattern_cfg is not None:
+            return generate_ray_pattern(self.pattern_cfg)
+        else:
+            return create_spherical_pattern(
+                n_scan_lines=self.config["n_scan_lines"],
+                n_points_per_line=self.config["n_points_per_line"],
+                fov_vertical=self.config["fov_vertical"],
+                fov_horizontal=self.config["fov_horizontal"]
+            )
 
-        # Create angular grids
-        vertical_angles = np.linspace(-fov_v / 2, fov_v / 2, n_scan_lines)
-        horizontal_angles = np.linspace(-fov_h / 2, fov_h / 2, n_points_per_line)
+    def _rotate_yaw_only(self, quat_wxyz: torch.Tensor, vec: torch.Tensor) -> torch.Tensor:
+        """Rotate vec by yaw (about z) extracted from quat. Supports broadcasting.
+        quat_wxyz: [B,4], vec: [...,3] where leading dim matches B via broadcasting rules.
+        Returns vec rotated only in XY plane and preserves z component.
+        """
+        # Extract yaw from quaternion
+        w, x, y, z = quat_wxyz.unbind(-1)
+        # yaw = atan2(2(wz + xy), 1 - 2(y^2 + z^2)) (assuming wxyz)
+        yaw = torch.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+        cy = torch.cos(yaw)
+        sy = torch.sin(yaw)
+        vx = vec[..., 0]
+        vy = vec[..., 1]
+        vz = vec[..., 2]
+        rx = cy * vx - sy * vy
+        ry = sy * vx + cy * vy
+        return torch.stack([rx, ry, vz], dim=-1)
 
-        # Generate ray vectors in spherical coordinates
-        ray_vectors = np.zeros((n_scan_lines, n_points_per_line, 3), dtype=np.float32)
-
-        for i, v_angle in enumerate(vertical_angles):
-            for j, h_angle in enumerate(horizontal_angles):
-                # Convert spherical to cartesian (x=forward, y=left, z=up)
-                ray_vectors[i, j, 0] = np.cos(v_angle) * np.cos(h_angle)  # x (forward)
-                ray_vectors[i, j, 1] = np.cos(v_angle) * np.sin(h_angle)  # y (left)
-                ray_vectors[i, j, 2] = np.sin(v_angle)  # z (up)
-
-        return ray_vectors
+    def _quat_rotate(self, quat_wxyz: torch.Tensor, vec: torch.Tensor) -> torch.Tensor:
+        """Rotate vec by full quaternion using rotation matrices. Supports broadcasting.
+        quat_wxyz: [B,4], vec: [B,S,P,3] or [B,3]."""
+        R = quat_to_R(quat_wxyz)  # [B,3,3]
+        if vec.dim() == 2:
+            return torch.einsum('bij,bj->bi', R, vec)
+        elif vec.dim() == 4:
+            return torch.einsum('bij,bspj->bspi', R, vec)
+        else:
+            # [S,P,3] with single R per-batch not supported here
+            raise ValueError("Unsupported vec shape for _quat_rotate")
 
     def read(self, envs_idx: Optional[List[int]] = None) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -439,6 +499,17 @@ class LidarSensor(Sensor):
         if not self.is_built:
             self.build()
             self.is_built = True
+
+        # Optional dynamic Livox pattern update
+        if self.pattern_cfg is not None and isinstance(self.pattern_cfg, LivoxPatternCfg) and self.pattern_generator:
+            updated = self.pattern_generator.update_dynamic_pattern(self.pattern_cfg, self.simulation_time)
+            if updated is not None:
+                # updated shape [1,N,3] or [S,P,3]; we keep starts same, replace dirs
+                updated_dirs = torch.tensor(updated, dtype=gs.tc_float, device=gs.device)
+                # Apply offset to new dirs
+                R_off = quat_to_R(self.offset_quat_wxyz.view(1, 4))[0]
+                updated_dirs = torch.einsum('ij,spj->spi', R_off, updated_dirs)
+                self.ray_dirs_local = updated_dirs
 
         if not self.only_cast_fixed:
             rigid_solver_decomp.kernel_update_all_verts(
@@ -458,18 +529,63 @@ class LidarSensor(Sensor):
             )
 
         n_envs = self.solver.free_verts_state.pos.shape[1]
-        n_scan_lines, n_points = self.ray_vectors.shape[:2]
+        S, P = self.ray_dirs_local.shape[:2]
+
+        # Ensure drift buffers exist and match n_envs
+        if self.drift is None or self.drift.shape[0] != n_envs:
+            self.drift = torch.zeros((n_envs, 3), dtype=gs.tc_float, device=gs.device)
+            self.ray_cast_drift = torch.zeros((n_envs, 3), dtype=gs.tc_float, device=gs.device)
 
         # Prepare output arrays
-        hit_points = torch.zeros(size=(n_envs, 1, n_scan_lines, n_points, 3), dtype=gs.tc_float)
-        hit_distances = torch.zeros(size=(n_envs, 1, n_scan_lines, n_points), dtype=gs.tc_float)
+        hit_points = torch.zeros(size=(n_envs, 1, S, P, 3), dtype=gs.tc_float, device=gs.device)
+        hit_distances = torch.zeros(size=(n_envs, 1, S, P), dtype=gs.tc_float, device=gs.device)
 
-        # Convert to numpy arrays and reshape for kernel
-        lidar_positions = self.solver.get_links_pos(links_idx=self.link_idx).squeeze(axis=1).reshape(n_envs, 1, 3)
-        lidar_quaternions = (
-            self.solver.get_links_quat(links_idx=self.link_idx).squeeze(axis=1).reshape(n_envs, 1, 4)
-        )  # wxyz format
+        # Get current LiDAR poses
+        lidar_positions = self.solver.get_links_pos(links_idx=self.link_idx).squeeze(axis=1).reshape(n_envs, 3)
+        lidar_quaternions = self.solver.get_links_quat(links_idx=self.link_idx).squeeze(axis=1).reshape(n_envs, 4)  # wxyz
 
+        # Apply world drift to origin
+        lidar_positions = lidar_positions + self.drift
+
+        # Build world rays per alignment
+        # Expand for broadcasting [B,1,S,P,3]
+        pos_w_exp = lidar_positions.view(n_envs, 1, 1, 1, 3)
+        # Ray starts/directions local
+        starts_local = self.ray_starts_local  # [S,P,3]
+        dirs_local = self.ray_dirs_local      # [S,P,3]
+
+        if self.ray_alignment == "world":
+            # apply horizontal drift in ray caster frame (XY)
+            pos_w = lidar_positions.clone()
+            pos_w[:, 0:2] += self.ray_cast_drift[:, 0:2]
+            pos_w_exp = pos_w.view(n_envs, 1, 1, 1, 3)
+            ray_starts_world = starts_local.view(1, 1, S, P, 3).expand(n_envs, 1, S, P, 3) + pos_w_exp
+            ray_dirs_world = dirs_local.view(1, 1, S, P, 3).expand(n_envs, 1, S, P, 3)
+        elif self.ray_alignment == "yaw":
+            # yaw rotate starts; directions unchanged
+            yaw_rot_starts = self._rotate_yaw_only(lidar_quaternions, starts_local)  # -> [B,S,P,3]
+            pos_w = lidar_positions.clone()
+            drift_yaw = self._rotate_yaw_only(lidar_quaternions, self.ray_cast_drift)
+            pos_w[:, 0:2] += drift_yaw[:, 0:2]
+            pos_w_exp = pos_w.view(n_envs, 1, 1, 1, 3)
+            ray_starts_world = yaw_rot_starts.view(n_envs, 1, S, P, 3) + pos_w_exp
+            ray_dirs_world = dirs_local.view(1, 1, S, P, 3).expand(n_envs, 1, S, P, 3)
+        elif self.ray_alignment == "base":
+            # full rotation for starts and directions
+            starts_batched = starts_local.view(1, S, P, 3).expand(n_envs, S, P, 3)
+            dirs_batched = dirs_local.view(1, S, P, 3).expand(n_envs, S, P, 3)
+            rot_starts = self._quat_rotate(lidar_quaternions, starts_batched)
+            rot_dirs = self._quat_rotate(lidar_quaternions, dirs_batched)
+            pos_w = lidar_positions.clone()
+            drift_base = self._quat_rotate(lidar_quaternions, self.ray_cast_drift)
+            pos_w[:, 0:2] += drift_base[:, 0:2]
+            pos_w_exp = pos_w.view(n_envs, 1, 1, 1, 3)
+            ray_starts_world = rot_starts.view(n_envs, 1, S, P, 3) + pos_w_exp
+            ray_dirs_world = rot_dirs.view(n_envs, 1, S, P, 3)
+        else:
+            raise RuntimeError(f"Unsupported ray_alignment type: {self.ray_alignment}")
+
+        # Cast rays
         kernel_cast_rays_bvh(
             map_lidar_faces=self.map_lidar_faces,
             fixed_verts_state=self.solver.fixed_verts_state,
@@ -478,9 +594,9 @@ class LidarSensor(Sensor):
             faces_info=self.solver.faces_info,
             bvh_nodes=self.bvh.nodes,
             bvh_morton_codes=self.bvh.morton_codes,
-            lidar_positions=lidar_positions,
-            lidar_quaternions=lidar_quaternions,
-            ray_vectors=self.ray_vectors,
+            ray_starts_world=ray_starts_world.contiguous(),
+            ray_directions_world=ray_dirs_world.contiguous(),
+            ray_directions_local=self.ray_dirs_local.contiguous(),
             far_plane=self.config["max_range"],
             hit_points=hit_points,
             hit_distances=hit_distances,
@@ -488,8 +604,11 @@ class LidarSensor(Sensor):
         )
 
         # Remove the camera dimension (we only have 1 camera per sensor)
-        hit_points = hit_points.squeeze(1)  # [n_env, n_scan_lines, n_points, 3]
-        hit_distances = hit_distances.squeeze(1)  # [n_env, n_scan_lines, n_points]
+        hit_points = hit_points.squeeze(1)  # [n_env, S, P, 3]
+        hit_distances = hit_distances.squeeze(1)  # [n_env, S, P]
+
+        # Apply post-cast vertical drift (z)
+        hit_points[..., 2] += self.ray_cast_drift[:, 2].view(n_envs, 1, 1)
 
         # Return requested subset
         if envs_idx is not None:

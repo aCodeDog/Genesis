@@ -255,10 +255,10 @@ def lidar_cast_rays_kernel_bvh(
         )
 
         lidar_quat = ti.math.vec4(
+            lidar_quaternions[env_id, cam_id, 0],  # w
             lidar_quaternions[env_id, cam_id, 1],  # x
             lidar_quaternions[env_id, cam_id, 2],  # y
             lidar_quaternions[env_id, cam_id, 3],  # z
-            lidar_quaternions[env_id, cam_id, 0],  # w
         )
 
         ray_dir_local = ti.math.vec3(
@@ -793,7 +793,7 @@ class LidarSensor(Sensor):
         # Prepare output arrays
         hit_points = np.zeros((n_envs, 1, n_scan_lines, n_points, 3), dtype=np.float32)
         hit_distances = np.zeros((n_envs, 1, n_scan_lines, n_points), dtype=np.float32)
-
+        link_pos[:,2]= link_pos[:,2]+1.
         # Convert to numpy arrays and reshape for kernel
         lidar_positions = tensor_to_array(link_pos).reshape(n_envs, 1, 3)
         lidar_quaternions = tensor_to_array(link_quat).reshape(n_envs, 1, 4)  # wxyz format

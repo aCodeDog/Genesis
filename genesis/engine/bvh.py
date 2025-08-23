@@ -4,6 +4,7 @@ from genesis.repr_base import RBC
 import numpy as np
 
 
+
 @ti.data_oriented
 class AABB(RBC):
     """
