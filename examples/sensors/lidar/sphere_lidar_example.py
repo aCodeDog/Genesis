@@ -16,6 +16,7 @@ import numpy as np
 import genesis as gs
 import time
 from typing import Optional
+from genesis.sensors.raycaster.lidar_pattern import SphericalPatternCfg,LivoxPatternCfg  # Use new pattern cfg
 
 
 def create_lidar_example_scene(n_envs=1):
@@ -28,13 +29,13 @@ def create_lidar_example_scene(n_envs=1):
     # Create scene
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(dt=0.02, substeps=2, gravity=(0.0, 0.0, -9.81)),
-        viewer_options=gs.options.ViewerOptions(
-            max_FPS=60,
-            camera_pos=(8.0, 8.0, 6.0) if n_envs == 1 else (25.0, 15.0, 12.0),  # Much higher and wider for multi-env
-            camera_lookat=(0.0, 0.0, 1.0) if n_envs == 1 else (10.0, 0.0, 1.0),  # Look at center of multi-env
-            camera_fov=60 if n_envs == 1 else 80,  # Wider FOV for multi-env
-        ),
-        vis_options=gs.options.VisOptions(rendered_envs_idx=list(range(n_envs))),  # Render all environments
+        # viewer_options=gs.options.ViewerOptions(
+        #     max_FPS=60,
+        #     camera_pos=(8.0, 8.0, 6.0) if n_envs == 1 else (25.0, 15.0, 12.0),  # Much higher and wider for multi-env
+        #     camera_lookat=(0.0, 0.0, 1.0) if n_envs == 1 else (10.0, 0.0, 1.0),  # Look at center of multi-env
+        #     camera_fov=60 if n_envs == 1 else 80,  # Wider FOV for multi-env
+        # ),
+        #vis_options=gs.options.VisOptions(rendered_envs_idx=list(range(n_envs))),  # Render all environments
         rigid_options=gs.options.RigidOptions(
             dt=0.02,
             constraint_solver=gs.constraint_solver.Newton,
@@ -150,14 +151,27 @@ def create_go2_robot_with_lidar(scene, n_envs=1):
         "min_range": 0.1,  # meters
     }
 
+    # New: use SphericalPatternCfg for the new Taichi-based LidarSensor
+    # pattern_cfg = SphericalPatternCfg(
+    #     n_scan_lines=lidar_config["n_scan_lines"],
+    #     n_points_per_line=lidar_config["n_points_per_line"],
+    #     fov_vertical=lidar_config["fov_vertical"],
+    #     fov_horizontal=lidar_config["fov_horizontal"],
+    # )
+    pattern_cfg =LivoxPatternCfg(
+        sensor_type='mid360'
+    )
     # Create LiDAR sensor attached to the robot's base link
-    LidarClass = gs.sensors.LidarSensorYiling  #
-    # LidarClass = gs.sensors.LidarSensor
+    LidarClass = gs.sensors.LidarSensorYiling  # New Taichi-based LiDAR
+    #LidarClass = gs.sensors.LidarSensor
 
     lidar_sensor = LidarClass(
         entity=robot,
         link_idx=None,  # Use base link
         use_local_frame=False,  # Return points in world frame
+        pattern_cfg=pattern_cfg,  # New pattern system
+        ray_alignment="base",  # Follow base frame
+        offset_pos=(0.0, 0.0, 0.2),  # Mount on top of base by 20cm
         **lidar_config,
     )
 
