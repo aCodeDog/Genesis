@@ -16,7 +16,7 @@ import numpy as np
 import genesis as gs
 import time
 from typing import Optional
-from genesis.sensors.raycaster.lidar_pattern import SphericalPatternCfg,LivoxPatternCfg  # Use new pattern cfg
+from genesis.sensors.raycaster.lidar_pattern import SphericalPatternCfg,LivoxPatternCfg,GridPatternCfg  # Use new pattern cfg
 
 
 def create_lidar_example_scene(n_envs=1):
@@ -161,6 +161,7 @@ def create_go2_robot_with_lidar(scene, n_envs=1):
     pattern_cfg =LivoxPatternCfg(
         sensor_type='mid360'
     )
+    #pattern_cfg = GridPatternCfg()
     # Create LiDAR sensor attached to the robot's base link
     LidarClass = gs.sensors.LidarSensorYiling  # New Taichi-based LiDAR
     #LidarClass = gs.sensors.LidarSensor
@@ -171,7 +172,7 @@ def create_go2_robot_with_lidar(scene, n_envs=1):
         use_local_frame=False,  # Return points in world frame
         pattern_cfg=pattern_cfg,  # New pattern system
         ray_alignment="base",  # Follow base frame
-        offset_pos=(0.0, 0.0, 0.2),  # Mount on top of base by 20cm
+        offset_pos=(0.0, 0.0, 2),  # Mount on top of base by 20cm
         **lidar_config,
     )
 
@@ -263,7 +264,7 @@ def run_lidar_simulation(scene, robot, lidar_sensor, base_init_pos, base_init_qu
     step_count = 0
     lidar_update_interval = 5  # Update LiDAR every 5 steps
     vis_update_interval = 10  # Update visualization every 10 steps
-    sphere_radius = 0.05  # Radius for LiDAR point visualization (bigger for visibility)
+    sphere_radius = 0.01  # Radius for LiDAR point visualization (bigger for visibility)
 
     # Point cloud visualization variables (one per environment)
     current_point_cloud_nodes = [None] * n_envs
