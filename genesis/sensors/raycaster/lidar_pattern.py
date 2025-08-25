@@ -235,7 +235,7 @@ class SphericalPatternGenerator(PatternGenerator):
 
 
 class LivoxPatternGenerator(PatternGenerator):
-    """Livox LiDAR pattern generator with caching (NumPy-based)."""
+    """Livox LiDAR pattern generator with caching (prefers precomputed .npy scan patterns)."""
     
     # Livox sensor parameters
     LIVOX_PARAMS = {
@@ -377,14 +377,76 @@ class LivoxPatternGenerator(PatternGenerator):
         return hashlib.md5(key_str.encode()).hexdigest()
     
     def _generate_taichi_pattern(self, cfg: LivoxPatternCfg, params: Dict) -> np.ndarray:
-        """Generate Livox pattern using NumPy RNG (no Taichi kernel needed)."""
-        total_samples = params['samples'] * 10
-        h_fov = math.radians(params.get('horizontal_fov', 360.0))
-        v_fov = math.radians(params.get('vertical_fov', 90.0))
-        rng = np.random.default_rng(seed=abs(hash(cfg.sensor_type)) % (2**32))
-        pattern_angles = np.empty((total_samples, 2), dtype=np.float32)
-        pattern_angles[:, 0] = rng.uniform(-0.5 * h_fov, 0.5 * h_fov, size=total_samples)  # theta
-        pattern_angles[:, 1] = rng.uniform(-0.5 * v_fov, 0.5 * v_fov, size=total_samples)  # phi
+        """Load Livox pattern angles from precomputed .npy files when available.
+        Falls back to NumPy RNG when files are missing.
+        Returns array of shape (N, 2) with columns [theta, phi] in radians.
+        """
+        import os
+        # Map sensor type to pattern filename (note HAP is upper-case)
+        pattern_files = {
+            "avia": "avia.npy",
+            "horizon": "horizon.npy",
+            "HAP": "HAP.npy",
+            "mid360": "mid360.npy",
+            "mid40": "mid40.npy",
+            "mid70": "mid70.npy",
+            "tele": "tele.npy",
+        }
+        pattern_file = pattern_files.get(cfg.sensor_type)
+        pattern_angles: Optional[np.ndarray] = None
+        if pattern_file is not None:
+            # Local scan_patterns directory relative to this file
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            local_path = os.path.join(script_dir, "patterns", pattern_file)
+            pattern_path = local_path
+            if not os.path.exists(pattern_path):
+                # Optional unified path fallback (kept for compatibility, may not exist)
+                omniperc_root = os.path.dirname(
+                    os.path.dirname(
+                        os.path.dirname(
+                            os.path.dirname(
+                                os.path.dirname(
+                                    os.path.dirname(script_dir)
+                                )
+                            )
+                        )
+                    )
+                )
+                unified_dir = os.path.join(
+                    omniperc_root,
+                    "LidarSensor",
+                    "LidarSensor",
+                    "sensor_pattern",
+                    "sensor_lidar",
+                    "scan_mode",
+                )
+                unified_path = os.path.join(unified_dir, pattern_file)
+                if os.path.exists(unified_path):
+                    pattern_path = unified_path
+            if os.path.exists(pattern_path):
+                data = np.load(pattern_path)
+                # Expect shape (N, 2): [theta, phi]
+                if isinstance(data, np.lib.npyio.NpzFile):
+                    # If accidentally using .npz, try common keys
+                    if "angles" in data:
+                        data = data["angles"]
+                    elif "theta" in data and "phi" in data:
+                        data = np.stack([data["theta"], data["phi"]], axis=-1)
+                    else:
+                        # Fallback: try first 2 columns of the first array
+                        first_key = list(data.files)[0]
+                        data = data[first_key]
+                if data.ndim == 2 and data.shape[1] >= 2:
+                    pattern_angles = data[:, :2].astype(np.float32)
+        # Fallback to RNG if files missing or invalid
+        if pattern_angles is None:
+            total_samples = params["samples"] * 10
+            h_fov = math.radians(params.get("horizontal_fov", 360.0))
+            v_fov = math.radians(params.get("vertical_fov", 90.0))
+            rng = np.random.default_rng(seed=abs(hash(cfg.sensor_type)) % (2**32))
+            pattern_angles = np.empty((total_samples, 2), dtype=np.float32)
+            pattern_angles[:, 0] = rng.uniform(-0.5 * h_fov, 0.5 * h_fov, size=total_samples)  # theta
+            pattern_angles[:, 1] = rng.uniform(-0.5 * v_fov, 0.5 * v_fov, size=total_samples)  # phi
         return pattern_angles
     
     def _sample_pattern(self, full_pattern: np.ndarray, cfg: LivoxPatternCfg) -> np.ndarray:
