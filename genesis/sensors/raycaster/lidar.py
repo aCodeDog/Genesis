@@ -2,125 +2,28 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 import taichi as ti
 import torch
-import trimesh
 
 import genesis as gs
+import genesis.utils.array_class as array_class
 from genesis.engine.entities import RigidEntity
 from genesis.engine.bvh import AABB, LBVH
 from genesis.utils.geom import (
-    transform_by_trans_quat,
-    ti_transform_by_quat,
-    ti_quat_mul,
     ti_normalize,
-    ti_identity_quat,
-    trans_quat_to_T,
     quat_to_R,
-    R_to_quat,
 )
 from genesis.utils.misc import tensor_to_array
+import genesis.engine.solvers.rigid.rigid_solver_decomp as rigid_solver_decomp
+
 
 from ..base_sensor import Sensor
+from .lidar_pattern import (
+    PatternBaseCfg, SphericalPatternCfg, LidarPatternCfg, BpearlPatternCfg, GridPatternCfg, LivoxPatternCfg,
+    generate_ray_pattern, create_spherical_pattern, create_pattern_generator, generate_ray_pattern_with_starts
+)
+from .camera_pattern import DepthCameraPatternCfg as _DepthCameraPatternCfg
+from .camera_pattern import generate_ray_pattern_with_starts as _cam_generate_ray_pattern_with_starts
 
-
-# Global constants for LiDAR ray casting - will be initialized when needed
-NO_HIT_RAY_VAL = None
-NO_HIT_SEGMENTATION_VAL = None
-
-
-def _ensure_lidar_constants_initialized():
-    """Ensure LiDAR constants are initialized."""
-    global NO_HIT_RAY_VAL, NO_HIT_SEGMENTATION_VAL
-
-    if NO_HIT_RAY_VAL is None:
-        NO_HIT_RAY_VAL = ti.field(dtype=ti.f32, shape=())
-        NO_HIT_SEGMENTATION_VAL = ti.field(dtype=ti.i32, shape=())
-
-        # Initialize constants
-        NO_HIT_RAY_VAL[None] = 1000.0
-        NO_HIT_SEGMENTATION_VAL[None] = -2
-
-
-@ti.data_oriented
-class LidarMeshData:
-    """
-    Mesh data structure with BVH acceleration for LiDAR ray casting.
-    """
-
-    def __init__(self, vertices: np.ndarray, triangles: np.ndarray):
-        """
-        Initialize mesh data with BVH acceleration.
-
-        Args:
-            vertices: Nx3 array of vertex positions
-            triangles: Mx3 array of triangle indices
-        """
-        self.n_vertices = vertices.shape[0]
-        self.n_triangles = triangles.shape[0]
-
-        # Store mesh geometry
-        self.vertices = ti.Vector.field(3, dtype=ti.f32, shape=self.n_vertices)
-        self.triangles = ti.Vector.field(3, dtype=ti.i32, shape=self.n_triangles)
-
-        # Copy data to Taichi fields
-        self.vertices.from_numpy(vertices.astype(np.float32))
-        self.triangles.from_numpy(triangles.astype(np.int32))
-
-        # Build BVH acceleration structure
-        self._build_bvh()
-
-    def _build_bvh(self):
-        """Build BVH for triangle acceleration."""
-        # Ensure we have at least one triangle
-        if self.n_triangles == 0:
-            raise ValueError("Cannot create BVH for mesh with 0 triangles")
-
-        # Create AABB for each triangle
-        self.triangle_aabbs = AABB(n_batches=1, n_aabbs=self.n_triangles)
-        self._compute_triangle_aabbs()
-
-        # Pre-compute AABB arrays for efficient kernel usage (static mesh optimization)
-        self.triangle_aabbs_min = np.zeros((self.n_triangles, 3), dtype=np.float32)
-        self.triangle_aabbs_max = np.zeros((self.n_triangles, 3), dtype=np.float32)
-
-        # Copy AABB data once during initialization
-        for i in range(self.n_triangles):
-            aabb = self.triangle_aabbs.aabbs[0, i]
-            self.triangle_aabbs_min[i, 0] = aabb.min[0]
-            self.triangle_aabbs_min[i, 1] = aabb.min[1]
-            self.triangle_aabbs_min[i, 2] = aabb.min[2]
-            self.triangle_aabbs_max[i, 0] = aabb.max[0]
-            self.triangle_aabbs_max[i, 1] = aabb.max[1]
-            self.triangle_aabbs_max[i, 2] = aabb.max[2]
-
-        # Build the BVH tree
-        self.bvh = LBVH(self.triangle_aabbs)
-        self.bvh.build()
-
-    @ti.kernel
-    def _compute_triangle_aabbs(self):
-        """Compute AABB for each triangle."""
-        for i in range(self.n_triangles):
-            # Get triangle vertices
-            v0_idx = self.triangles[i][0]
-            v1_idx = self.triangles[i][1]
-            v2_idx = self.triangles[i][2]
-
-            v0 = self.vertices[v0_idx]
-            v1 = self.vertices[v1_idx]
-            v2 = self.vertices[v2_idx]
-
-            # Compute AABB with small epsilon for robustness
-            eps = 1e-6
-            min_pos = ti.min(ti.min(v0, v1), v2) - eps
-            max_pos = ti.max(ti.max(v0, v1), v2) + eps
-
-            # Store in AABB structure
-            self.triangle_aabbs.aabbs[0, i].min = min_pos
-            self.triangle_aabbs.aabbs[0, i].max = max_pos
-
-
-# Global Taichi kernels - defined outside class to avoid initialization issues
-_lidar_kernels = None
+MapLidarFaces = ti.template()
 
 
 @ti.func
@@ -223,17 +126,54 @@ def ray_aabb_intersection(ray_start, ray_dir, aabb_min, aabb_max):
 
 
 @ti.kernel
-def lidar_cast_rays_kernel_bvh(
-    # Mesh data (now using Taichi fields directly - no CPU->GPU transfer!)
-    mesh_vertices: ti.template(),  # GPU Taichi field [n_vertices, 3]
-    mesh_triangles: ti.template(),  # GPU Taichi field [n_triangles, 3]
+def kernel_update_aabbs(
+    map_lidar_faces: MapLidarFaces,
+    free_verts_state: array_class.VertsState,
+    fixed_verts_state: array_class.VertsState,
+    verts_info: array_class.VertsInfo,
+    faces_info: array_class.FacesInfo,
+    aabb_state: array_class.AABBState,
+):
+    _B = free_verts_state.pos.shape[1]
+    # n_faces = faces_info.geom_idx.shape[0]
+    n_faces = map_lidar_faces.shape[0]
+    # step 1: update free verts
+    for i_b, i_f_ in ti.ndrange(_B, n_faces):
+        i_f = map_lidar_faces[i_f_]
+        aabb_state.aabbs[i_b, i_f].min.fill(np.inf)
+        aabb_state.aabbs[i_b, i_f].max.fill(-np.inf)
+
+        is_free = verts_info.is_free[faces_info.verts_idx[i_f][0]]
+        if is_free:
+            for i in ti.static(range(3)):
+                i_v = verts_info.verts_state_idx[faces_info.verts_idx[i_f][i]]
+                pos_v = free_verts_state.pos[i_v, i_b]
+                aabb_state.aabbs[i_b, i_f].min = ti.min(aabb_state.aabbs[i_b, i_f].min, pos_v)
+                aabb_state.aabbs[i_b, i_f].max = ti.max(aabb_state.aabbs[i_b, i_f].max, pos_v)
+
+        elif i_b == 0:  #
+            for i in ti.static(range(3)):
+                i_v = verts_info.verts_state_idx[faces_info.verts_idx[i_f][i]]
+                pos_v = fixed_verts_state.pos[i_v]
+                aabb_state.aabbs[i_b, i_f].min = ti.min(aabb_state.aabbs[i_b, i_f].min, pos_v)
+                aabb_state.aabbs[i_b, i_f].max = ti.max(aabb_state.aabbs[i_b, i_f].max, pos_v)
+
+
+@ti.kernel
+def kernel_cast_rays_bvh(
+    map_lidar_faces: MapLidarFaces,
+    fixed_verts_state: array_class.VertsState,
+    free_verts_state: array_class.VertsState,
+    verts_info: array_class.VertsInfo,
+    faces_info: array_class.FacesInfo,
     # BVH data structures
     bvh_nodes: ti.template(),  # The BVH node tree
     bvh_morton_codes: ti.template(),  # Maps sorted leaves to original triangle indices
-    # Per-ray data
-    lidar_positions: ti.types.ndarray(ndim=3),  # [n_env, n_cam, 3]
-    lidar_quaternions: ti.types.ndarray(ndim=3),  # [n_env, n_cam, 4] (wxyz format)
-    ray_vectors: ti.types.ndarray(ndim=3),  # [n_scan_lines, n_points, 3]
+    # Per-ray data (precomputed, world frame)
+    ray_starts_world: ti.types.ndarray(ndim=5),  # [n_env, n_cam, n_scan_lines, n_points, 3]
+    ray_directions_world: ti.types.ndarray(ndim=5),  # [n_env, n_cam, n_scan_lines, n_points, 3]
+    # Optional local directions for local-frame output
+    ray_directions_local: ti.types.ndarray(ndim=3),  # [n_scan_lines, n_points, 3]
     far_plane: ti.f32,
     # Output arrays
     hit_points: ti.types.ndarray(ndim=5),  # [n_env, n_cam, n_scan_lines, n_points, 3]
@@ -241,35 +181,26 @@ def lidar_cast_rays_kernel_bvh(
     world_frame: ti.i32,
 ):
     """
-    Taichi kernel for LiDAR ray casting.
+    Taichi kernel for LiDAR ray casting, accelerated by a Bounding Volume Hierarchy (BVH).
     """
-    n_triangles = mesh_triangles.shape[0]
-
+    n_triangles = map_lidar_faces.shape[0]
     # Parallel execution over all rays
     for env_id, cam_id, scan_line, point_index in ti.ndrange(
         hit_points.shape[0], hit_points.shape[1], hit_points.shape[2], hit_points.shape[3]
     ):
-        # --- 1. Setup Ray ---
-        lidar_position = ti.math.vec3(
-            lidar_positions[env_id, cam_id, 0], lidar_positions[env_id, cam_id, 1], lidar_positions[env_id, cam_id, 2]
+        # --- 1. Setup Ray (already in world frame) ---
+        ray_start_world = ti.math.vec3(
+            ray_starts_world[env_id, cam_id, scan_line, point_index, 0],
+            ray_starts_world[env_id, cam_id, scan_line, point_index, 1],
+            ray_starts_world[env_id, cam_id, scan_line, point_index, 2],
         )
-
-        lidar_quat = ti.math.vec4(
-            lidar_quaternions[env_id, cam_id, 0],  # w
-            lidar_quaternions[env_id, cam_id, 1],  # x
-            lidar_quaternions[env_id, cam_id, 2],  # y
-            lidar_quaternions[env_id, cam_id, 3],  # z
+        ray_direction_world = ti_normalize(
+            ti.math.vec3(
+                ray_directions_world[env_id, cam_id, scan_line, point_index, 0],
+                ray_directions_world[env_id, cam_id, scan_line, point_index, 1],
+                ray_directions_world[env_id, cam_id, scan_line, point_index, 2],
+            )
         )
-
-        ray_dir_local = ti.math.vec3(
-            ray_vectors[scan_line, point_index, 0],
-            ray_vectors[scan_line, point_index, 1],
-            ray_vectors[scan_line, point_index, 2],
-        )
-        ray_dir_local = ti_normalize(ray_dir_local)
-
-        # Transform ray direction to world coordinates.
-        ray_direction_world = ti_transform_by_quat(ray_dir_local, lidar_quat)
 
         # --- 2. BVH Traversal ---
         min_t = far_plane
@@ -288,7 +219,7 @@ def lidar_cast_rays_kernel_bvh(
             node = bvh_nodes[0, node_idx]
 
             # Check if ray hits the node's bounding box
-            aabb_t = ray_aabb_intersection(lidar_position, ray_direction_world, node.bound.min, node.bound.max)
+            aabb_t = ray_aabb_intersection(ray_start_world, ray_direction_world, node.bound.min, node.bound.max)
 
             if aabb_t >= 0.0 and aabb_t < min_t:
                 if node.left == -1:  # It's a LEAF node
@@ -296,17 +227,30 @@ def lidar_cast_rays_kernel_bvh(
                     # We need to find the original triangle index.
                     sorted_leaf_idx = node_idx - (n_triangles - 1)
                     original_tri_idx = bvh_morton_codes[0, sorted_leaf_idx][1]
-                    tri_indices = mesh_triangles[original_tri_idx]
-                    v0 = mesh_vertices[tri_indices[0]]
-                    v1 = mesh_vertices[tri_indices[1]]
-                    v2 = mesh_vertices[tri_indices[2]]
+
+                    i_f = map_lidar_faces[original_tri_idx]
+                    is_free = verts_info.is_free[faces_info.verts_idx[i_f][0]]
+
+                    v0 = ti.Vector.zero(gs.ti_float, 3)
+                    v1 = ti.Vector.zero(gs.ti_float, 3)
+                    v2 = ti.Vector.zero(gs.ti_float, 3)
+
+                    if is_free:
+                        v0 = free_verts_state.pos[verts_info.verts_state_idx[faces_info.verts_idx[i_f][0]], env_id]
+                        v1 = free_verts_state.pos[verts_info.verts_state_idx[faces_info.verts_idx[i_f][1]], env_id]
+                        v2 = free_verts_state.pos[verts_info.verts_state_idx[faces_info.verts_idx[i_f][2]], env_id]
+
+                    else:
+                        v0 = fixed_verts_state.pos[verts_info.verts_state_idx[faces_info.verts_idx[i_f][0]]]
+                        v1 = fixed_verts_state.pos[verts_info.verts_state_idx[faces_info.verts_idx[i_f][1]]]
+                        v2 = fixed_verts_state.pos[verts_info.verts_state_idx[faces_info.verts_idx[i_f][2]]]
 
                     # Perform the expensive ray-triangle intersection test
-                    hit_result = ray_triangle_intersection(lidar_position, ray_direction_world, v0, v1, v2)
+                    hit_result = ray_triangle_intersection(ray_start_world, ray_direction_world, v0, v1, v2)
 
                     if hit_result.w > 0.0 and hit_result.x < min_t and hit_result.x >= 0.0:
                         min_t = hit_result.x
-                        hit_face = original_tri_idx
+                        hit_face = i_f
                         # hit_u, hit_v could be stored here if needed
 
                 else:  # It's an INTERNAL node
@@ -323,12 +267,19 @@ def lidar_cast_rays_kernel_bvh(
             hit_distances[env_id, cam_id, scan_line, point_index] = dist
 
             if world_frame:
-                hit_point = lidar_position + dist * ray_direction_world
+                hit_point = ray_start_world + dist * ray_direction_world
                 hit_points[env_id, cam_id, scan_line, point_index, 0] = hit_point.x
                 hit_points[env_id, cam_id, scan_line, point_index, 1] = hit_point.y
                 hit_points[env_id, cam_id, scan_line, point_index, 2] = hit_point.z
             else:
-                hit_point = dist * ray_dir_local
+                # Local frame output along provided local ray direction
+                hit_point = dist * ti_normalize(
+                    ti.math.vec3(
+                        ray_directions_local[scan_line, point_index, 0],
+                        ray_directions_local[scan_line, point_index, 1],
+                        ray_directions_local[scan_line, point_index, 2],
+                    )
+                )
                 hit_points[env_id, cam_id, scan_line, point_index, 0] = hit_point.x
                 hit_points[env_id, cam_id, scan_line, point_index, 1] = hit_point.y
                 hit_points[env_id, cam_id, scan_line, point_index, 2] = hit_point.z
@@ -341,68 +292,12 @@ def lidar_cast_rays_kernel_bvh(
 
 
 @ti.data_oriented
-class LidarKernels:
-    """
-    Simplified LiDAR kernels without complex BVH integration.
-    """
-
-    def __init__(self):
-        self.mesh_data = None
-
-    def register_mesh(self, vertices: np.ndarray, triangles: np.ndarray):
-        """
-        Register a mesh for ray casting.
-
-        Args:
-            vertices: Nx3 array of vertex positions
-            triangles: Mx3 array of triangle indices
-        """
-        self.mesh_data = LidarMeshData(vertices, triangles)
-
-    def cast_rays(
-        self, lidar_positions, lidar_quaternions, ray_vectors, far_plane, hit_points, hit_distances, world_frame
-    ):
-        """Call the Taichi kernel for ray casting."""
-        if self.mesh_data is None:
-            raise RuntimeError("No mesh registered")
-
-        # Call the BVH-accelerated kernel
-        lidar_cast_rays_kernel_bvh(
-            self.mesh_data.vertices,
-            self.mesh_data.triangles,
-            self.mesh_data.bvh.nodes,
-            self.mesh_data.bvh.morton_codes,
-            lidar_positions,
-            lidar_quaternions,
-            ray_vectors,
-            far_plane,
-            hit_points,
-            hit_distances,
-            world_frame,
-        )
-
-
-@ti.data_oriented
 class LidarSensor(Sensor):
     """
-    LiDAR sensor that performs ray casting to get distance measurements and point clouds.
-
-    Parameters
-    ----------
-    entity : RigidEntity
-        The entity to which this sensor is attached.
-    link_idx : int, optional
-        The index of the link to which this sensor is attached. If None, defaults to the base link.
-    use_local_frame : bool
-        Whether to return points in the local frame of the sensor. Defaults to False (world frame).
-    config : dict, optional
-        LiDAR configuration with parameters like:
-        - n_scan_lines: Number of vertical scan lines
-        - n_points_per_line: Number of horizontal points per scan line
-        - fov_vertical: Vertical field of view in degrees
-        - fov_horizontal: Horizontal field of view in degrees
-        - max_range: Maximum sensing range
-        - min_range: Minimum sensing range
+    Taichi-accelerated LiDAR sensor using BVH traversal.
+    - Supports multiple ray patterns with pattern_cfg.
+    - Mounting offset and alignment modes: world, yaw, base.
+    - Optional dynamic Livox updates.
     """
 
     _mesh_registered = False
@@ -426,7 +321,13 @@ class LidarSensor(Sensor):
         fov_horizontal: float = 360.0,
         max_range: float = 20.0,
         min_range: float = 0.1,
-    ):  # Yiling: let's use direct argument for better typing
+        only_cast_fixed: bool = False,
+        pattern_cfg: Optional[PatternBaseCfg] = None,
+        # New: mounting offset and alignment + drift like Warp
+        offset_pos: Tuple[float, float, float] = (0.0, 0.0, 0.0),
+        offset_quat_wxyz: Tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0),
+        ray_alignment: str = "base",  # one of {"world","yaw","base"}
+    ):
 
         self._entity = entity
         self._sim = entity._sim
@@ -442,332 +343,158 @@ class LidarSensor(Sensor):
             "min_range": min_range,
         }
 
-        # Initialize kernels globally if not done
-        if LidarSensor._kernels is None:
-            # Ensure Taichi constants are initialized
-            _ensure_lidar_constants_initialized()
-            LidarSensor._kernels = LidarKernels()
+        self.only_cast_fixed = only_cast_fixed
 
-        # Generate ray pattern
-        self.ray_vectors = self._create_ray_pattern()
+        # Store pattern configuration
+        self.pattern_cfg = pattern_cfg
 
-        # Note: For static mesh approach, no per-instance caching needed
-        # TODO: Add dynamic entity tracking for future dynamic mesh support
+        # Initialize pattern generator for dynamic patterns
+        self.pattern_generator = None
+        if self.pattern_cfg and isinstance(self.pattern_cfg, LivoxPatternCfg):
+            self.pattern_generator = create_pattern_generator(self.pattern_cfg)
+
+        # Mounting offset and alignment
+        self.offset_pos = torch.tensor(offset_pos, dtype=gs.tc_float, device=gs.device)
+        self.offset_quat_wxyz = torch.tensor(offset_quat_wxyz, dtype=gs.tc_float, device=gs.device)
+        self.ray_alignment = ray_alignment
+
+        # Generate ray pattern (local starts + dirs), then apply offset
+        self._init_local_rays_with_offset()
+
+        # Drift buffers (world drift on origin; per-ray-cast drift in sensor frame)
+        # Defer allocation until solver is built
+        self.drift = None
+        self.ray_cast_drift = None
+
+        # Dynamic pattern tracking
+        self.simulation_time = 0.0
+        self.last_pattern_update_time = 0.0
+
+        # build bvh
+        self.solver = self._sim.rigid_solver
+        self.is_built = False
+
+    def _init_local_rays_with_offset(self):
+        # Get local starts and directions in sensor frame
+        if self.pattern_cfg is not None:
+            if isinstance(self.pattern_cfg, LivoxPatternCfg) and self.pattern_generator is not None:
+                # Use the persistent generator instance so generated_patterns is populated
+                dirs_np = self.pattern_generator.generate_pattern(self.pattern_cfg)
+                starts_np = np.zeros_like(dirs_np, dtype=np.float32)
+            elif isinstance(self.pattern_cfg, _DepthCameraPatternCfg):
+                # Use camera pattern generator for depth camera cfg
+                starts_np, dirs_np = _cam_generate_ray_pattern_with_starts(self.pattern_cfg)
+            else:
+                # Non-Livox (or no generator instance): use convenience util
+                starts_np, dirs_np = generate_ray_pattern_with_starts(self.pattern_cfg)
+        else:
+            # default spherical
+            dirs_np = create_spherical_pattern(
+                n_scan_lines=self.config["n_scan_lines"],
+                n_points_per_line=self.config["n_points_per_line"],
+                fov_vertical=self.config["fov_vertical"],
+                fov_horizontal=self.config["fov_horizontal"],
+            )
+            starts_np = np.zeros_like(dirs_np, dtype=np.float32)
+
+        # Convert to torch
+        self.ray_starts_local = torch.tensor(starts_np, dtype=gs.tc_float, device=gs.device)  # [S,P,3]
+        self.ray_dirs_local = torch.tensor(dirs_np, dtype=gs.tc_float, device=gs.device)      # [S,P,3]
+
+        # Apply mounting offset: rotate directions, translate starts
+        # Build rotation matrix from offset quaternion (wxyz)
+        R_off = quat_to_R(self.offset_quat_wxyz.view(1, 4))[0]  # [3,3]
+        self.ray_dirs_local = torch.einsum('ij,spj->spi', R_off, self.ray_dirs_local)
+        self.ray_starts_local = self.ray_starts_local + self.offset_pos.view(1, 1, 3)
+
+    def filter_lidar_faces(self):
+        n_lidar_faces = self.solver.faces_info.geom_idx.shape[0]
+        np_map_lidar_faces = np.arange(n_lidar_faces)
+        if self.only_cast_fixed:
+            # count the number of faces in a fixed geoms
+            geom_is_fixed = np.logical_not(self.solver.geoms_info.is_free.to_numpy())
+            faces_geom = self.solver.faces_info.geom_idx.to_numpy()
+            n_lidar_faces = np.sum(geom_is_fixed[faces_geom])
+            np_map_lidar_faces = np.where(geom_is_fixed[faces_geom])[0]
+        # from IPython import embed; embed()
+        return n_lidar_faces, np_map_lidar_faces
+
+    def build(self):
+        n_lidar_faces, np_map_lidar_faces = self.filter_lidar_faces()
+
+        self.n_lidar_faces = n_lidar_faces
+        self.map_lidar_faces = ti.field(ti.i32, (n_lidar_faces))
+        self.map_lidar_faces.from_numpy(np_map_lidar_faces)
+
+        self.aabbs = AABB(n_batches=self.solver.free_verts_state.pos.shape[1], n_aabbs=self.n_lidar_faces)
+
+        rigid_solver_decomp.kernel_update_all_verts(
+            geoms_state=self.solver.geoms_state,
+            verts_info=self.solver.verts_info,
+            free_verts_state=self.solver.free_verts_state,
+            fixed_verts_state=self.solver.fixed_verts_state,
+        )
+
+        kernel_update_aabbs(
+            map_lidar_faces=self.map_lidar_faces,
+            free_verts_state=self.solver.free_verts_state,
+            fixed_verts_state=self.solver.fixed_verts_state,
+            verts_info=self.solver.verts_info,
+            faces_info=self.solver.faces_info,
+            aabb_state=self.aabbs,
+        )
+
+        self.bvh = LBVH(self.aabbs)
+        self.bvh.build()
+
+        # Allocate drift buffers now that we know n_envs
+        n_envs = self.solver.free_verts_state.pos.shape[1]
+        if self.drift is None or self.drift.shape[0] != n_envs:
+            self.drift = torch.zeros((n_envs, 3), dtype=gs.tc_float, device=gs.device)
+            self.ray_cast_drift = torch.zeros((n_envs, 3), dtype=gs.tc_float, device=gs.device)
 
     def _create_ray_pattern(self) -> np.ndarray:
-        """Create LiDAR ray pattern based on configuration."""
-        n_scan_lines = self.config["n_scan_lines"]
-        n_points_per_line = self.config["n_points_per_line"]
-        fov_v = np.radians(self.config["fov_vertical"])
-        fov_h = np.radians(self.config["fov_horizontal"])
-
-        # Create angular grids
-        vertical_angles = np.linspace(-fov_v / 2, fov_v / 2, n_scan_lines)
-        horizontal_angles = np.linspace(-fov_h / 2, fov_h / 2, n_points_per_line)
-
-        # Generate ray vectors in spherical coordinates
-        ray_vectors = np.zeros((n_scan_lines, n_points_per_line, 3), dtype=np.float32)
-
-        for i, v_angle in enumerate(vertical_angles):
-            for j, h_angle in enumerate(horizontal_angles):
-                # Convert spherical to cartesian (x=forward, y=left, z=up)
-                ray_vectors[i, j, 0] = np.cos(v_angle) * np.cos(h_angle)  # x (forward)
-                ray_vectors[i, j, 1] = np.cos(v_angle) * np.sin(h_angle)  # y (left)
-                ray_vectors[i, j, 2] = np.sin(v_angle)  # z (up)
-
-        return ray_vectors
-
-    def _extract_static_scene_data(self):
-        """Extract static mesh data from scene entities once during initialization."""
-        if LidarSensor._scene_mesh_data is not None:
-            return  # Already extracted
-
-        import time
-
-        start_time = time.time()
-
-        mesh_data = {"entities": [], "total_geometry_count": 0}
-
-        # Process rigid entities
-        if self._sim.rigid_solver.is_active():
-            for rigid_entity in self._sim.rigid_solver.entities:
-                # Skip the LiDAR sensor's own entity to avoid self-detection
-                if rigid_entity == self._entity:
-                    continue
-
-                entity_data = {"type": "rigid", "entity": rigid_entity, "geometries": []}
-
-                # Choose visual or collision geometry based on surface vis_mode
-                if rigid_entity.surface.vis_mode == "visual":
-                    geoms = rigid_entity.vgeoms
-                else:
-                    geoms = rigid_entity.geoms
-
-                for geom_idx, geom in enumerate(geoms):
-                    try:
-                        # Get the original trimesh from the geometry (in local coordinates)
-                        if "sdf" in rigid_entity.surface.vis_mode:
-                            mesh = geom.get_sdf_trimesh()
-                        else:
-                            mesh = geom.get_trimesh()
-
-                        if len(mesh.vertices) > 0 and len(mesh.faces) > 0:
-                            # Store original mesh data (no transformation applied)
-                            geom_data = {
-                                "geom": geom,
-                                "vertices": mesh.vertices.astype(np.float32),
-                                "faces": mesh.faces.astype(np.int32),
-                                "vertex_count": len(mesh.vertices),
-                                "triangle_count": len(mesh.faces),
-                            }
-                            entity_data["geometries"].append(geom_data)
-                            mesh_data["total_geometry_count"] += 1
-
-                    except Exception as e:
-                        print(f"Warning: Could not extract mesh from geom {geom}: {e}")
-                        continue
-
-                if entity_data["geometries"]:  # Only add if we found geometries
-                    mesh_data["entities"].append(entity_data)
-
-        # Process avatar entities if present
-        if hasattr(self._sim, "avatar_solver") and self._sim.avatar_solver.is_active():
-            for avatar_entity in self._sim.avatar_solver.entities:
-                if avatar_entity == self._entity:
-                    continue
-
-                entity_data = {"type": "avatar", "entity": avatar_entity, "geometries": []}
-
-                # Choose visual or collision geometry
-                if avatar_entity.surface.vis_mode == "visual":
-                    geoms = avatar_entity.vgeoms
-                else:
-                    geoms = avatar_entity.geoms
-
-                for geom in geoms:
-                    try:
-                        if "sdf" in avatar_entity.surface.vis_mode:
-                            mesh = geom.get_sdf_trimesh()
-                        else:
-                            mesh = geom.get_trimesh()
-
-                        if len(mesh.vertices) > 0 and len(mesh.faces) > 0:
-                            geom_data = {
-                                "geom": geom,
-                                "vertices": mesh.vertices.astype(np.float32),
-                                "faces": mesh.faces.astype(np.int32),
-                                "vertex_count": len(mesh.vertices),
-                                "triangle_count": len(mesh.faces),
-                            }
-                            entity_data["geometries"].append(geom_data)
-                            mesh_data["total_geometry_count"] += 1
-
-                    except Exception as e:
-                        print(f"Warning: Could not extract mesh from avatar geom {geom}: {e}")
-                        continue
-
-                if entity_data["geometries"]:
-                    mesh_data["entities"].append(entity_data)
-
-        # Process tool entities if present
-        if hasattr(self._sim, "tool_solver") and self._sim.tool_solver.is_active():
-            for tool_entity in self._sim.tool_solver.entities:
-                if tool_entity == self._entity:
-                    continue
-
-                entity_data = {"type": "tool", "entity": tool_entity, "geometries": []}
-
-                try:
-                    vertices = tool_entity.mesh.raw_vertices
-                    faces = tool_entity.mesh.faces_np
-
-                    if len(vertices) > 0 and len(faces) > 0:
-                        geom_data = {
-                            "tool_mesh": tool_entity.mesh,
-                            "vertices": vertices.astype(np.float32),
-                            "faces": faces.astype(np.int32),
-                            "vertex_count": len(vertices),
-                            "triangle_count": len(faces),
-                        }
-                        entity_data["geometries"].append(geom_data)
-                        mesh_data["total_geometry_count"] += 1
-
-                except Exception as e:
-                    print(f"Warning: Could not extract mesh from tool entity {tool_entity}: {e}")
-                    continue
-
-                if entity_data["geometries"]:
-                    mesh_data["entities"].append(entity_data)
-
-        end_time = time.time()
-        mesh_data["extraction_time"] = (end_time - start_time) * 1000  # in milliseconds
-
-        LidarSensor._scene_mesh_data = mesh_data
-        print(f"LiDAR: Extracted static scene data with {mesh_data['total_geometry_count']} geometries")
-        print(f"       from {len(mesh_data['entities'])} entities in {mesh_data['extraction_time']:.1f}ms")
-
-        # Check if we're dealing with multi-environment scenario
-        n_envs = getattr(self._sim, "n_envs", 1)
-        if n_envs > 1:
-            print(f"Note: Genesis replicates entities across {n_envs} environments.")
-            print(f"      LiDAR uses mesh data from all replicated entities with proper world transforms.")
-
-    def _extract_scene_geometry(self) -> Tuple[np.ndarray, np.ndarray]:
-        """Extract static mesh data from Genesis scene once during initialization."""
-        # Only extract once - static mesh approach
-        if LidarSensor._scene_geometry_cache is not None:
-            return LidarSensor._scene_geometry_cache
-
-        # Ensure static mesh data is extracted
-        if LidarSensor._scene_mesh_data is None:
-            self._extract_static_scene_data()
-
-        import time
-
-        start_time = time.time()
-
-        all_vertices = []
-        all_triangles = []
-        vertex_offset = 0
-
-        # Store detailed mesh information for debugging
-        mesh_info = {
-            "entities": [],
-            "total_vertices": 0,
-            "total_triangles": 0,
-            "geometry_count": 0,
-            "extraction_time": None,
-        }
-
-        # Process each entity using pre-extracted static data
-        # For static mesh, we transform to world coordinates at initialization time
-        for entity_data in LidarSensor._scene_mesh_data["entities"]:
-            entity = entity_data["entity"]
-            entity_info = {
-                "type": entity_data["type"],
-                "entity": entity,
-                "geometries": [],
-                "vertex_count": 0,
-                "triangle_count": 0,
-            }
-
-            # Get entity world transformation at initialization time
-            try:
-                entity_pos = entity.get_pos()
-                entity_quat = entity.get_quat()
-
-                # Convert to numpy arrays for transformation
-                if hasattr(entity_pos, "cpu"):
-                    entity_pos_np = entity_pos.cpu().numpy()
-                else:
-                    entity_pos_np = np.array(entity_pos)
-
-                if hasattr(entity_quat, "cpu"):
-                    entity_quat_np = entity_quat.cpu().numpy()
-                else:
-                    entity_quat_np = np.array(entity_quat)
-
-                # Compute world transformation matrix
-                world_transform = trans_quat_to_T(entity_pos_np, entity_quat_np)
-                if world_transform.ndim == 3:
-                    world_transform = world_transform[0]
-
-                # Process each geometry for this entity
-                for geom_data in entity_data["geometries"]:
-                    # Apply world transformation to pre-extracted vertices
-                    original_vertices = geom_data["vertices"]
-                    original_faces = geom_data["faces"]
-
-                    # Transform vertices to world coordinates (static - done once)
-                    vertices_homogeneous = np.hstack(
-                        [original_vertices, np.ones((len(original_vertices), 1), dtype=np.float32)]
-                    )
-                    transformed_vertices = (world_transform @ vertices_homogeneous.T).T[:, :3]
-
-                    # Store geometry info
-                    geom_info = {
-                        "geom": geom_data.get("geom"),
-                        "vertices": len(transformed_vertices),
-                        "triangles": len(original_faces),
-                        "vertex_offset": vertex_offset,
-                        "world_pos": entity_pos_np,
-                        "world_quat": entity_quat_np,
-                    }
-                    entity_info["geometries"].append(geom_info)
-                    entity_info["vertex_count"] += len(transformed_vertices)
-                    entity_info["triangle_count"] += len(original_faces)
-                    mesh_info["geometry_count"] += 1
-
-                    # Add transformed vertices and faces
-                    all_vertices.append(transformed_vertices.astype(np.float32))
-                    triangles = original_faces.astype(np.int32) + vertex_offset
-                    all_triangles.append(triangles)
-
-                    vertex_offset += len(transformed_vertices)
-
-            except Exception as e:
-                print(f"Warning: Could not get transformation for entity {entity}: {e}")
-                continue
-
-            if entity_info["geometries"]:  # Only add if we found geometries
-                mesh_info["entities"].append(entity_info)
-
-        # Combine all meshes
-        if len(all_vertices) > 0:
-            combined_vertices = np.vstack(all_vertices)
-            combined_triangles = np.vstack(all_triangles)
+        """Create LiDAR ray pattern based on configuration.
+        Deprecated by _init_local_rays_with_offset for new flow; kept for compatibility."""
+        if self.pattern_cfg is not None:
+            return generate_ray_pattern(self.pattern_cfg)
         else:
-            # If no geometry found, create a minimal ground plane
-            print("Warning: No scene geometry found, creating minimal ground plane")
-            ground_size = 50.0
-            combined_vertices = np.array(
-                [
-                    [-ground_size, -ground_size, 0],
-                    [ground_size, -ground_size, 0],
-                    [ground_size, ground_size, 0],
-                    [-ground_size, ground_size, 0],
-                ],
-                dtype=np.float32,
+            return create_spherical_pattern(
+                n_scan_lines=self.config["n_scan_lines"],
+                n_points_per_line=self.config["n_points_per_line"],
+                fov_vertical=self.config["fov_vertical"],
+                fov_horizontal=self.config["fov_horizontal"]
             )
-            combined_triangles = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int32)
 
-            # Add ground plane to mesh info
-            mesh_info["entities"].append(
-                {
-                    "type": "ground_plane",
-                    "entity": None,
-                    "geometries": [{"vertices": 4, "triangles": 2, "vertex_offset": 0}],
-                    "vertex_count": 4,
-                    "triangle_count": 2,
-                }
-            )
-            mesh_info["geometry_count"] += 1
+    def _rotate_yaw_only(self, quat_wxyz: torch.Tensor, vec: torch.Tensor) -> torch.Tensor:
+        """Rotate vec by yaw (about z) extracted from quat. Supports broadcasting.
+        quat_wxyz: [B,4], vec: [...,3] where leading dim matches B via broadcasting rules.
+        Returns vec rotated only in XY plane and preserves z component.
+        """
+        # Extract yaw from quaternion
+        w, x, y, z = quat_wxyz.unbind(-1)
+        # yaw = atan2(2(wz + xy), 1 - 2(y^2 + z^2)) (assuming wxyz)
+        yaw = torch.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+        cy = torch.cos(yaw)
+        sy = torch.sin(yaw)
+        vx = vec[..., 0]
+        vy = vec[..., 1]
+        vz = vec[..., 2]
+        rx = cy * vx - sy * vy
+        ry = sy * vx + cy * vy
+        return torch.stack([rx, ry, vz], dim=-1)
 
-        # Finalize mesh info
-        end_time = time.time()
-        mesh_info["total_vertices"] = len(combined_vertices)
-        mesh_info["total_triangles"] = len(combined_triangles)
-        mesh_info["extraction_time"] = (end_time - start_time) * 1000  # in milliseconds
-
-        # Cache the static mesh data permanently
-        LidarSensor._scene_geometry_cache = (combined_vertices, combined_triangles)
-        LidarSensor._scene_mesh_info = mesh_info
-
-        print(
-            f"LiDAR: Extracted static scene geometry with {len(combined_vertices)} vertices and {len(combined_triangles)} triangles"
-        )
-        print(f"       from {mesh_info['geometry_count']} geometries across {len(mesh_info['entities'])} entities")
-        print(f"       static mesh extraction took {mesh_info['extraction_time']:.1f}ms")
-
-        return LidarSensor._scene_geometry_cache
-
-    def _ensure_mesh_registered(self):
-        """Ensure the scene mesh is registered with the kernels (static mesh - done once)."""
-        # Only register once for static mesh
-        if not LidarSensor._mesh_registered:
-            vertices, triangles = self._extract_scene_geometry()
-            LidarSensor._kernels.register_mesh(vertices, triangles)
-            LidarSensor._mesh_registered = True
+    def _quat_rotate(self, quat_wxyz: torch.Tensor, vec: torch.Tensor) -> torch.Tensor:
+        """Rotate vec by full quaternion using rotation matrices. Supports broadcasting.
+        quat_wxyz: [B,4], vec: [B,S,P,3] or [B,3]."""
+        R = quat_to_R(quat_wxyz)  # [B,3,3]
+        if vec.dim() == 2:
+            return torch.einsum('bij,bj->bi', R, vec)
+        elif vec.dim() == 4:
+            return torch.einsum('bij,bspj->bspi', R, vec)
+        else:
+            # [S,P,3] with single R per-batch not supported here
+            raise ValueError("Unsupported vec shape for _quat_rotate")
 
     def read(self, envs_idx: Optional[List[int]] = None) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -780,38 +507,127 @@ class LidarSensor(Sensor):
             hit_points: Hit points array [n_env, n_scan_lines, n_points, 3]
             hit_distances: Hit distances array [n_env, n_scan_lines, n_points]
         """
-        # Ensure static mesh is registered (done once)
-        self._ensure_mesh_registered()
+        if not self.is_built:
+            self.build()
+            self.is_built = True
 
-        # Get sensor pose
-        link_pos = self._sim.rigid_solver.get_links_pos(links_idx=self.link_idx).squeeze(axis=1)
-        link_quat = self._sim.rigid_solver.get_links_quat(links_idx=self.link_idx).squeeze(axis=1)
+        # Sync the internal simulation time with the simulator so dynamic patterns update correctly
+        try:
+            # Use absolute simulator time (accounts for substeps)
+            self.simulation_time = float(self._sim.cur_t)
+        except Exception:
+            # Fallback: increment by step dt if cur_t is unavailable
+            self.simulation_time += float(getattr(self._sim, "dt", 0.0) or 0.0)
 
-        n_envs = link_pos.shape[0]
-        n_scan_lines, n_points = self.ray_vectors.shape[:2]
+        # Optional dynamic Livox pattern update
+        if self.pattern_cfg is not None and isinstance(self.pattern_cfg, LivoxPatternCfg) and self.pattern_generator:
+            updated = self.pattern_generator.update_dynamic_pattern(self.pattern_cfg, self.simulation_time)
+            if updated is not None:
+                # updated shape [1,N,3] or [S,P,3]; we keep starts same, replace dirs
+                updated_dirs = torch.tensor(updated, dtype=gs.tc_float, device=gs.device)
+                # Apply offset to new dirs
+                R_off = quat_to_R(self.offset_quat_wxyz.view(1, 4))[0]
+                updated_dirs = torch.einsum('ij,spj->spi', R_off, updated_dirs)
+                self.ray_dirs_local = updated_dirs
+
+        if not self.only_cast_fixed:
+            rigid_solver_decomp.kernel_update_all_verts(
+                geoms_state=self.solver.geoms_state,
+                verts_info=self.solver.verts_info,
+                free_verts_state=self.solver.free_verts_state,
+                fixed_verts_state=self.solver.fixed_verts_state,
+            )
+
+            kernel_update_aabbs(
+                map_lidar_faces=self.map_lidar_faces,
+                free_verts_state=self.solver.free_verts_state,
+                fixed_verts_state=self.solver.fixed_verts_state,
+                verts_info=self.solver.verts_info,
+                faces_info=self.solver.faces_info,
+                aabb_state=self.aabbs,
+            )
+
+        n_envs = self.solver.free_verts_state.pos.shape[1]
+        S, P = self.ray_dirs_local.shape[:2]
+
+        # Ensure drift buffers exist and match n_envs
+        if self.drift is None or self.drift.shape[0] != n_envs:
+            self.drift = torch.zeros((n_envs, 3), dtype=gs.tc_float, device=gs.device)
+            self.ray_cast_drift = torch.zeros((n_envs, 3), dtype=gs.tc_float, device=gs.device)
 
         # Prepare output arrays
-        hit_points = np.zeros((n_envs, 1, n_scan_lines, n_points, 3), dtype=np.float32)
-        hit_distances = np.zeros((n_envs, 1, n_scan_lines, n_points), dtype=np.float32)
-        link_pos[:,2]= link_pos[:,2]+1.
-        # Convert to numpy arrays and reshape for kernel
-        lidar_positions = tensor_to_array(link_pos).reshape(n_envs, 1, 3)
-        lidar_quaternions = tensor_to_array(link_quat).reshape(n_envs, 1, 4)  # wxyz format
+        hit_points = torch.zeros(size=(n_envs, 1, S, P, 3), dtype=gs.tc_float, device=gs.device)
+        hit_distances = torch.zeros(size=(n_envs, 1, S, P), dtype=gs.tc_float, device=gs.device)
 
-        # Call Taichi kernel for ray casting against static mesh
-        LidarSensor._kernels.cast_rays(
-            lidar_positions,
-            lidar_quaternions,
-            self.ray_vectors,
-            self.config["max_range"],
-            hit_points,
-            hit_distances,
-            0 if self._use_local_frame else 1,
+        # Get current LiDAR poses
+        lidar_positions = self.solver.get_links_pos(links_idx=self.link_idx).squeeze(axis=1).reshape(n_envs, 3)
+        lidar_quaternions = self.solver.get_links_quat(links_idx=self.link_idx).squeeze(axis=1).reshape(n_envs, 4)  # wxyz
+
+        # Apply world drift to origin
+        lidar_positions = lidar_positions + self.drift
+
+        # Build world rays per alignment
+        # Expand for broadcasting [B,1,S,P,3]
+        pos_w_exp = lidar_positions.view(n_envs, 1, 1, 1, 3)
+        # Ray starts/directions local
+        starts_local = self.ray_starts_local  # [S,P,3]
+        dirs_local = self.ray_dirs_local      # [S,P,3]
+
+        if self.ray_alignment == "world":
+            # apply horizontal drift in ray caster frame (XY)
+            pos_w = lidar_positions.clone()
+            pos_w[:, 0:2] += self.ray_cast_drift[:, 0:2]
+            pos_w_exp = pos_w.view(n_envs, 1, 1, 1, 3)
+            ray_starts_world = starts_local.view(1, 1, S, P, 3).expand(n_envs, 1, S, P, 3) + pos_w_exp
+            ray_dirs_world = dirs_local.view(1, 1, S, P, 3).expand(n_envs, 1, S, P, 3)
+        elif self.ray_alignment == "yaw":
+            # yaw rotate starts; directions unchanged
+            yaw_rot_starts = self._rotate_yaw_only(lidar_quaternions, starts_local)  # -> [B,S,P,3]
+            pos_w = lidar_positions.clone()
+            drift_yaw = self._rotate_yaw_only(lidar_quaternions, self.ray_cast_drift)
+            pos_w[:, 0:2] += drift_yaw[:, 0:2]
+            pos_w_exp = pos_w.view(n_envs, 1, 1, 1, 3)
+            ray_starts_world = yaw_rot_starts.view(n_envs, 1, S, P, 3) + pos_w_exp
+            ray_dirs_world = dirs_local.view(1, 1, S, P, 3).expand(n_envs, 1, S, P, 3)
+        elif self.ray_alignment == "base":
+            # full rotation for starts and directions
+            starts_batched = starts_local.view(1, S, P, 3).expand(n_envs, S, P, 3)
+            dirs_batched = dirs_local.view(1, S, P, 3).expand(n_envs, S, P, 3)
+            rot_starts = self._quat_rotate(lidar_quaternions, starts_batched)
+            rot_dirs = self._quat_rotate(lidar_quaternions, dirs_batched)
+            pos_w = lidar_positions.clone()
+            drift_base = self._quat_rotate(lidar_quaternions, self.ray_cast_drift)
+            pos_w[:, 0:2] += drift_base[:, 0:2]
+            pos_w_exp = pos_w.view(n_envs, 1, 1, 1, 3)
+            ray_starts_world = rot_starts.view(n_envs, 1, S, P, 3) + pos_w_exp
+            ray_dirs_world = rot_dirs.view(n_envs, 1, S, P, 3)
+        else:
+            raise RuntimeError(f"Unsupported ray_alignment type: {self.ray_alignment}")
+
+        # Cast rays
+        kernel_cast_rays_bvh(
+            map_lidar_faces=self.map_lidar_faces,
+            fixed_verts_state=self.solver.fixed_verts_state,
+            free_verts_state=self.solver.free_verts_state,
+            verts_info=self.solver.verts_info,
+            faces_info=self.solver.faces_info,
+            bvh_nodes=self.bvh.nodes,
+            bvh_morton_codes=self.bvh.morton_codes,
+            ray_starts_world=ray_starts_world.contiguous(),
+            ray_directions_world=ray_dirs_world.contiguous(),
+            ray_directions_local=self.ray_dirs_local.contiguous(),
+            far_plane=self.config["max_range"],
+            hit_points=hit_points,
+            hit_distances=hit_distances,
+            world_frame=0 if self._use_local_frame else 1,
         )
 
         # Remove the camera dimension (we only have 1 camera per sensor)
-        hit_points = hit_points.squeeze(1)  # [n_env, n_scan_lines, n_points, 3]
-        hit_distances = hit_distances.squeeze(1)  # [n_env, n_scan_lines, n_points]
+        hit_points = hit_points.squeeze(1)  # [n_env, S, P, 3]
+        hit_distances = hit_distances.squeeze(1)  # [n_env, S, P]
+
+        # Apply post-cast vertical drift (z)
+        hit_points[..., 2] += self.ray_cast_drift[:, 2].view(n_envs, 1, 1)
 
         # Return requested subset
         if envs_idx is not None:
@@ -894,6 +710,8 @@ class LidarSensor(Sensor):
             - geometry_count: Number of geometries processed
             - extraction_time: Time taken to extract meshes (in milliseconds)
         """
+        print("TODO: get_mesh_info not implemented")
+        return
         # Ensure mesh is extracted
         self._extract_scene_geometry()
         return LidarSensor._scene_mesh_info
@@ -906,6 +724,8 @@ class LidarSensor(Sensor):
             vertices: Nx3 array of vertex positions
             triangles: Mx3 array of triangle indices
         """
+        print("TODO: get_scene_mesh not implemented")
+        return
         try:
             return self._extract_scene_geometry()
         except Exception as e:
@@ -922,6 +742,8 @@ class LidarSensor(Sensor):
         Returns:
             True if successful, False otherwise
         """
+        print("TODO: save_scene_mesh not implemented")
+        return
         try:
             vertices, triangles = self._extract_scene_geometry()
             if vertices is not None and triangles is not None:
@@ -938,6 +760,8 @@ class LidarSensor(Sensor):
             return False
 
     def print_mesh_summary(self):
+        print("TODO: print_mesh_summary not implemented")
+        return
         """Print a summary of the extracted scene mesh information."""
         mesh_info = self.get_mesh_info()
         if mesh_info is None:

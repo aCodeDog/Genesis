@@ -84,6 +84,16 @@ class LivoxPatternCfg(PatternBaseCfg):
     pattern_rotation_speed: float = 0.1  # Rotation speed for dynamic patterns
 
 
+@dataclass
+class SpinningLidarPatternCfg(PatternBaseCfg):
+    """Configuration for traditional spinning lidars (HDL64, VLP32, OS128)."""
+    sensor_type: str = "hdl64"  # one of {"hdl64", "vlp32", "os128"}
+    f_rot: float = 10.0          # rotation frequency (Hz)
+    sample_rate: float = 2.2e6   # samples per second (defaults for HDL64)
+    n_channels: int = 64         # number of channels (64/32/128)
+    phi_fov: Tuple[float, float] = (-24.9, 2.0)  # deg, used for HDL64 when no custom table
+
+
 class PatternGenerator:
     """Base class for pattern generators using Taichi."""
     
@@ -297,6 +307,8 @@ class LivoxPatternGenerator(PatternGenerator):
         super().__init__()
         self.current_start_index = 0
         self.generated_patterns = {}  # Instance-level pattern storage
+        # Track last update tick for time-based dynamic updates
+        self._last_update_tick: Optional[int] = None
     
     def generate_pattern(self, cfg: LivoxPatternCfg) -> np.ndarray:
         """Generate Livox pattern with caching."""
@@ -449,13 +461,18 @@ class LivoxPatternGenerator(PatternGenerator):
             pattern_angles[:, 1] = rng.uniform(-0.5 * v_fov, 0.5 * v_fov, size=total_samples)  # phi
         return pattern_angles
     
-    def _sample_pattern(self, full_pattern: np.ndarray, cfg: LivoxPatternCfg) -> np.ndarray:
-        """Sample a subset of rays from the full pattern."""
+    def _sample_pattern(self, full_pattern: np.ndarray, cfg: LivoxPatternCfg, start_index: Optional[int] = None) -> np.ndarray:
+        """Sample a subset of rays from the full pattern.
+        If start_index is provided, sampling starts from there; otherwise uses cfg.rolling_window_start.
+        """
         total_rays = full_pattern.shape[0]
         samples = min(cfg.samples, total_rays)
         
-        # Rolling window sampling (like original implementation)
-        start_idx = cfg.rolling_window_start % total_rays
+        # Rolling window sampling start
+        if start_index is None:
+            start_idx = cfg.rolling_window_start % total_rays
+        else:
+            start_idx = start_index % total_rays
         
         if start_idx + samples <= total_rays:
             selected_angles = full_pattern[start_idx:start_idx + samples]
@@ -496,28 +513,92 @@ class LivoxPatternGenerator(PatternGenerator):
         return ray_directions.reshape(1, -1, 3)
     
     def update_dynamic_pattern(self, cfg: LivoxPatternCfg, time_step: float) -> Optional[np.ndarray]:
-        """Update pattern for dynamic Livox sensors."""
+        """Update pattern for dynamic Livox sensors by advancing an internal rolling index.
+        time_step is treated as the current simulation time in seconds. We update once per tick
+        determined by pattern_update_rate (updates per second). No new cfg is created.
+        """
         if not cfg.enable_dynamic_pattern or cfg.sensor_type not in self.generated_patterns:
             return None
         
-        # Update rolling window start index based on time
-        pattern_update_rate = 100  # Update every 100 time steps
-        if int(time_step * pattern_update_rate) != int((time_step - 0.02) * pattern_update_rate):
-            # Create new config with updated rolling window
-            new_cfg = LivoxPatternCfg(
-                sensor_type=cfg.sensor_type,
-                samples=cfg.samples,
-                downsample=cfg.downsample,
-                rolling_window_start=(cfg.rolling_window_start + cfg.samples) % (cfg.samples * 10),
-                enable_dynamic_pattern=cfg.enable_dynamic_pattern,
-                pattern_rotation_speed=cfg.pattern_rotation_speed
-            )
-            
-            # Generate new sample
-            full_pattern = self.generated_patterns[cfg.sensor_type]
-            return self._sample_pattern(full_pattern, new_cfg)
+        # Determine whether to update this call. Default: 10 updates/sec (every 0.1s).
+        # You can map pattern_rotation_speed to a rate if desired; keep simple for now.
+        pattern_update_rate = 10  # Hz
+        current_tick = int(time_step * pattern_update_rate + 1e-6)
+        if self._last_update_tick is not None and current_tick == self._last_update_tick:
+            return None  # Not time to update yet
         
-        return None
+        # Time to update
+        self._last_update_tick = current_tick
+        full_pattern = self.generated_patterns[cfg.sensor_type]
+        total_rays = full_pattern.shape[0]
+        
+        # Advance rolling window by one frame worth of samples
+        self.current_start_index = (self.current_start_index + cfg.samples) % total_rays
+        
+        # Sample using the updated start index
+        return self._sample_pattern(full_pattern, cfg, start_index=self.current_start_index)
+    
+
+class SpinningLidarPatternGenerator(PatternGenerator):
+    """Spinning lidar pattern generator (Velodyne HDL64/VLP32, Ouster OS128)."""
+
+    VLP32_ANGLES_DEG = np.array([
+        -25.0, -22.5, -20.0, -15.0, -13.0, -10.0, -5.0, -3.0,
+        -2.333, -1.0, -0.667, -0.333, 0.0, 0.0, 0.333, 0.667,
+        1.0, 1.333, 1.667, 2.0, 2.333, 2.667, 3.0, 3.333,
+        3.667, 4.0, 5.0, 7.0, 10.0, 15.0, 17.0, 20.0
+    ], dtype=np.float32)
+
+    def generate_pattern(self, cfg: SpinningLidarPatternCfg) -> np.ndarray:
+        sensor = cfg.sensor_type.lower()
+        if sensor not in {"hdl64", "vlp32", "os128"}:
+            raise ValueError(f"Unsupported spinning lidar type: {cfg.sensor_type}")
+
+        # Determine vertical angles (phi) and channel count
+        if sensor == "hdl64":
+            n_channels = cfg.n_channels if cfg.n_channels is not None else 64
+            phi_min, phi_max = np.deg2rad(cfg.phi_fov)
+            phi = np.linspace(phi_min, phi_max, n_channels, dtype=np.float32)
+            f_rot = cfg.f_rot
+            sample_rate = cfg.sample_rate if cfg.sample_rate is not None else 2.2e6
+        elif sensor == "vlp32":
+            phi = np.deg2rad(self.VLP32_ANGLES_DEG)
+            n_channels = phi.shape[0]
+            f_rot = cfg.f_rot
+            sample_rate = cfg.sample_rate if cfg.sample_rate is not None else 1.2e6
+        else:  # os128
+            n_channels = cfg.n_channels if cfg.n_channels is not None else 128
+            phi = np.deg2rad(np.linspace(-22.5, 22.5, n_channels, dtype=np.float32))
+            f_rot = cfg.f_rot if cfg.f_rot is not None else 20.0
+            sample_rate = cfg.sample_rate if cfg.sample_rate is not None else 5.2e6
+
+        # Time sequence over one rotation
+        t = np.arange(0.0, 1.0 / f_rot, n_channels / sample_rate, dtype=np.float32)[:, None]
+        # Horizontal angles (theta)
+        theta = (2.0 * np.pi * f_rot * t) % (2.0 * np.pi)
+
+        # Broadcast to grids
+        theta_grid = theta + np.zeros((1, n_channels), dtype=np.float32)
+        phi_grid = np.zeros_like(theta, dtype=np.float32) + phi
+
+        # Flatten
+        theta_flat = theta_grid.reshape(-1)
+        phi_flat = phi_grid.reshape(-1)
+
+        # Convert to directions (x=forward, y=left, z=up)
+        cos_theta = np.cos(theta_flat)
+        sin_theta = np.sin(theta_flat)
+        cos_phi = np.cos(phi_flat)
+        sin_phi = np.sin(phi_flat)
+        x = cos_theta * cos_phi
+        y = sin_theta * cos_phi
+        z = sin_phi
+        dirs = np.stack([x, y, z], axis=1).astype(np.float32)
+        # Normalize (safety)
+        norms = np.linalg.norm(dirs, axis=1, keepdims=True)
+        dirs = dirs / np.maximum(norms, 1e-8)
+        # Return as [1, N, 3]
+        return dirs.reshape(1, -1, 3)
 
 
 # Pattern generator factory
@@ -527,6 +608,7 @@ PATTERN_GENERATORS = {
     BpearlPatternCfg: BpearlPatternGenerator,
     SphericalPatternCfg: SphericalPatternGenerator,
     LivoxPatternCfg: LivoxPatternGenerator,
+    SpinningLidarPatternCfg: SpinningLidarPatternGenerator,
 }
 
 
@@ -662,5 +744,47 @@ def create_livox_pattern(
         downsample=downsample,
         use_simple_grid=use_simple_grid,
         enable_dynamic_pattern=enable_dynamic_pattern
+    )
+    return generate_ray_pattern(cfg)
+
+
+def create_spinning_lidar_pattern(
+    sensor_type: str = "hdl64",
+    f_rot: float = 10.0,
+    sample_rate: Optional[float] = None,
+    n_channels: Optional[int] = None,
+    phi_fov: Tuple[float, float] = (-24.9, 2.0),
+) -> np.ndarray:
+    """Create pattern for traditional spinning lidars.
+    - hdl64 defaults: f_rot=10Hz, sample_rate=2.2e6, n_channels=64, phi_fov as given
+    - vlp32 defaults: f_rot=10Hz, sample_rate=1.2e6
+    - os128 defaults: f_rot=20Hz, sample_rate=5.2e6, n_channels=128
+    """
+    # Fill sensible defaults per model when None
+    st = sensor_type.lower()
+    if st == "vlp32":
+        if sample_rate is None:
+            sample_rate = 1.2e6
+        if n_channels is None:
+            n_channels = 32
+    elif st == "os128":
+        if f_rot is None:
+            f_rot = 20.0
+        if sample_rate is None:
+            sample_rate = 5.2e6
+        if n_channels is None:
+            n_channels = 128
+    else:  # hdl64
+        if sample_rate is None:
+            sample_rate = 2.2e6
+        if n_channels is None:
+            n_channels = 64
+
+    cfg = SpinningLidarPatternCfg(
+        sensor_type=st,
+        f_rot=f_rot,
+        sample_rate=sample_rate,
+        n_channels=n_channels,
+        phi_fov=phi_fov,
     )
     return generate_ray_pattern(cfg)
